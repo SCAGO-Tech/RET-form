@@ -3,7 +3,11 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { motion } from 'framer-motion';
 import { z } from 'zod';
-import { Loader2, CheckCircle, AlertCircle } from 'lucide-react';
+import { 
+  Loader2Icon as Loader2,
+  CheckCircleIcon as CheckCircle,
+  AlertCircleIcon as AlertCircle
+} from 'lucide-react';
 import { supabase } from '../lib/supabase';
 
 // Canadian postal code regex
@@ -12,6 +16,7 @@ const postalCodeRegex = /^[A-Za-z]\d[A-Za-z][ -]?\d[A-Za-z]\d$/;
 const phoneRegex = /^\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$/;
 
 const provinces = [
+  
   'Ontario',
   'Quebec',
   'Nova Scotia',
@@ -35,25 +40,25 @@ const formSchema = z.object({
   postalCode: z.string().regex(postalCodeRegex, 'Please enter a valid postal code'),
   email: z.string().email('Please enter a valid email'),
   phoneNumber: z.string().regex(phoneRegex, 'Please enter a valid phone number (e.g., XXX-XXX-XXXX)'),
-  dateGrantRequested: z.string(),
+  dateGrantRequested: z.string().min(1, 'Date is required'),
   fundsUsage: z.string().min(10, 'Please provide more details'),
   previousGrant: z.boolean(),
   previousGrantUsage: z.string().optional(),
   supportLetter: z
     .any()
-    .optional()
+    .refine((files) => files && files[0], "Support letter is required")
     .refine((files) => {
-      if (!files || !files[0]) return true; // Optional file
+      if (!files || !files[0]) return false;
       const file = files[0];
       return file instanceof File;
     }, "Invalid file")
     .refine((files) => {
-      if (!files || !files[0]) return true;
+      if (!files || !files[0]) return false;
       const file = files[0];
       return file.size <= MAX_FILE_SIZE;
     }, "File size must be less than 5MB")
     .refine((files) => {
-      if (!files || !files[0]) return true;
+      if (!files || !files[0]) return false;
       const file = files[0];
       return ACCEPTED_FILE_TYPES.includes(file.type);
     }, "Only .pdf, .jpg, and .png files are accepted"),
@@ -102,32 +107,107 @@ export const GrantApplicationForm: React.FC<Props> = ({
     setSubmitError(null);
 
     try {
-      // First, ensure we have an authenticated session
-      setIsAuthenticating(true);
-      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      let supportLetterUrl = '';
       
-      if (!sessionData.session) {
-        // If no session exists, sign up anonymously
-        const { error: signUpError } = await supabase.auth.signUp({
-          email: data.email,
-          password: crypto.randomUUID(), // Generate a random password for anonymous auth
-          options: {
-            data: {
-              full_name: data.applicantName,
-            },
-          },
-        });
+      // Handle file upload to Supabase Storage
+      if (data.supportLetter && data.supportLetter[0]) {
+        const file = data.supportLetter[0];
+        const fileExt = file.name.split('.').pop()?.toLowerCase();
+        
+        // Create filename using applicant name
+        const sanitizedName = data.applicantName
+          .trim()
+          .replace(/[^a-zA-Z0-9\s]/g, '')
+          .replace(/\s+/g, '-');
+        
+        const fileName = `${sanitizedName}-Support-Letter.${fileExt}`;
 
-        if (signUpError) throw signUpError;
+        try {
+          // Upload new file
+          const { data: uploadData, error: uploadError } = await supabase
+            .storage
+            .from('support-letters')
+            .upload(fileName, file, {
+              cacheControl: '3600',
+              upsert: true
+            });
+
+          if (uploadError) {
+            console.error('Upload error details:', uploadError);
+            throw uploadError;
+          }
+
+          // Get the public URL using Supabase's getPublicUrl method
+          const { data: { publicUrl } } = supabase
+            .storage
+            .from('support-letters')
+            .getPublicUrl(fileName);
+
+          supportLetterUrl = publicUrl;
+
+          // Verify the file exists
+          const { data: checkData, error: checkError } = await supabase
+            .storage
+            .from('support-letters')
+            .list('', {
+              search: fileName
+            });
+
+          if (checkError || !checkData?.length) {
+            throw new Error('File upload verification failed');
+          }
+
+        } catch (error) {
+          console.error('Storage error:', error);
+          throw new Error('Failed to upload support letter. Please try again.');
+        }
       }
-      setIsAuthenticating(false);
 
-      // Get the current user
-      const { data: { user }, error: userError } = await supabase.auth.getUser();
-      if (userError) throw userError;
-      if (!user) throw new Error('No authenticated user');
+      // Prepare payload with all data including file URL
+      const formPayload = {
+        applicant_name: data.applicantName,
+        mailing_address: `${data.street}, ${data.city}, ${data.province} ${data.postalCode}`,
+        email: data.email,
+        phone_number: data.phoneNumber,
+        date_requested: data.dateGrantRequested,
+        funds_usage: data.fundsUsage,
+        previous_grant: Boolean(data.previousGrant),
+        previous_grant_usage: data.previousGrantUsage,
+        verify_information: Boolean(data.verifyInformation),
+        support_letter: {
+          file_name: data.supportLetter?.[0]?.name || '',
+          file_url: supportLetterUrl
+        }
+      };
 
-      // Now insert the application data
+      try {
+        // Send to Make webhook
+        await fetch('https://hook.us2.make.com/tfps36ob9e2dwbxul7ol4ilqr4am67yl', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(formPayload),
+        });
+      } catch (makeError) {
+        console.error('Make webhook error:', makeError);
+      }
+
+      try {
+        // Send to Retool webhook
+        await fetch('https://api.retool.com/v1/workflows/97f6fb26-de8a-4cd1-bcf6-86fc922bd846/startTrigger', {
+          method: 'POST',
+          mode: 'no-cors',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(formPayload),
+        });
+      } catch (retoolError) {
+        console.error('Retool webhook error:', retoolError);
+      }
+
+      // Insert into Supabase database
       const { error: insertError } = await supabase.from('grant_applications').insert([
         {
           applicant_name: data.applicantName,
@@ -136,26 +216,14 @@ export const GrantApplicationForm: React.FC<Props> = ({
           phone_number: data.phoneNumber,
           date_requested: data.dateGrantRequested,
           funds_usage: data.fundsUsage,
-          previous_grant: data.previousGrant,
+          previous_grant: Boolean(data.previousGrant),
           previous_grant_usage: data.previousGrantUsage,
-          verify_information: data.verifyInformation,
-          user_id: user.id,
+          verify_information: Boolean(data.verifyInformation),
+          support_letter_url: supportLetterUrl // Store the URL in the database
         },
       ]);
 
       if (insertError) throw insertError;
-
-      if (data.supportLetter && data.supportLetter[0]) {
-        const file = data.supportLetter[0];
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${user.id}/${Date.now()}-${data.applicantName}.${fileExt}`;
-
-        const { error: uploadError } = await supabase.storage
-          .from('support-letters')
-          .upload(fileName, file);
-
-        if (uploadError) throw uploadError;
-      }
 
       setSubmitSuccess(true);
       onSuccess?.();
@@ -163,7 +231,6 @@ export const GrantApplicationForm: React.FC<Props> = ({
       setSubmitError(error instanceof Error ? error.message : 'An error occurred');
     } finally {
       setIsSubmitting(false);
-      setIsAuthenticating(false);
     }
   };
 
